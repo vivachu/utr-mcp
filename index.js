@@ -227,37 +227,84 @@ server.tool("get_event_details",
 );
 
 server.tool("get_player_stats",
-  "Aggregate win/loss stats with avg and peak opponent UTR.",
+  "Aggregate win/loss stats with avg and peak opponent UTR, drawn from full match history.",
   {
     player_id: z.string().optional(),
-    limit: z.number().optional().default(100),
+    limit: z.number().optional().default(500),
   },
   async ({ player_id, limit }) => {
     const pid = player_id ?? DEFAULT_PLAYER_ID;
     if (!pid) throw new Error("No player_id and UTR_PLAYER_ID not set.");
-    const ov      = await v4(`/v4/player/${pid}/overview`);
-    const me      = extractSelf(ov?.results ?? [], pid);
-    const results = (ov?.results ?? []).slice(0, limit);
+    // /overview for profile header; /results for full match history (208+ matches)
+    const [ov, rv] = await Promise.all([
+      v4(`/v4/player/${pid}/overview`),
+      v4(`/v4/player/${pid}/results`),
+    ]);
+    const me = extractSelf(ov?.results ?? [], pid);
+    const { wins: totalWins = 0, losses: totalLosses = 0, events = [] } = rv;
+
     let wins = 0, losses = 0;
     const oppUtrs = [];
-    for (const r of results) {
-      const isWin = r.isWinner === true;
-      const opp   = isWin ? (r.players?.loser1 ?? r.players?.loser2) : (r.players?.winner1 ?? r.players?.winner2);
-      if (isWin) wins++; else losses++;
-      const u = opp?.singlesUtr ?? opp?.myUtrSingles;
-      if (u) oppUtrs.push(u);
+    let counted = 0;
+    outer: for (const event of events) {
+      const draws = event.draws ?? (event.results ? [{ results: event.results }] : []);
+      for (const draw of draws) {
+        for (const r of (draw.results ?? [])) {
+          if (counted >= limit) break outer;
+          const isWin = r.isWinner === true;
+          const opp   = isWin ? (r.players?.loser1 ?? r.players?.loser2) : (r.players?.winner1 ?? r.players?.winner2);
+          if (isWin) wins++; else losses++;
+          const u = opp?.singlesUtr ?? opp?.myUtrSingles;
+          if (u) oppUtrs.push(u);
+          counted++;
+        }
+      }
     }
+
     const total = wins + losses;
     const lines = [
       `## Stats — ${me?.firstName ?? ""} ${me?.lastName ?? ""}`,
       `**Singles UTR:** ${me?.singlesUtrDisplay ?? "Unrated"}`,
       `**Doubles UTR:** ${me?.doublesUtrDisplay ?? "Unrated"}`,
       "",
-      `**Record (last ${total}):** ${wins}W – ${losses}L`,
+      `**Overall record:** ${totalWins}W – ${totalLosses}L`,
+      `**Analysed (last ${total}):** ${wins}W – ${losses}L`,
       `**Win %:** ${total > 0 ? ((wins/total)*100).toFixed(1)+"%" : "N/A"}`,
       `**Avg Opponent UTR:** ${oppUtrs.length ? (oppUtrs.reduce((s,v)=>s+v,0)/oppUtrs.length).toFixed(2) : "N/A"}`,
       `**Peak Opponent UTR:** ${oppUtrs.length ? Math.max(...oppUtrs).toFixed(2) : "N/A"}`,
     ];
+    return { content: [{ type: "text", text: lines.join("\n") }] };
+  }
+);
+
+server.tool("probe_endpoints",
+  "Diagnostic: probe v4 endpoint variations to find full match history pagination.",
+  { player_id: z.string().optional() },
+  async ({ player_id }) => {
+    const pid = player_id ?? DEFAULT_PLAYER_ID;
+    const tests = [
+      [`/v4/player/${pid}/results`, {}],
+      [`/v4/player/${pid}/results`, { resultsCount: 20 }],
+      [`/v4/player/${pid}/results`, { count: 20 }],
+      [`/v4/player/${pid}/results`, { take: 20 }],
+      [`/v4/player/${pid}/results`, { top: 20 }],
+      [`/v4/player/${pid}/results`, { limit: 20 }],
+      [`/v4/player/${pid}/results`, { pageSize: 20 }],
+      [`/v4/player/${pid}/overview`, { resultsCount: 10 }],
+      [`/v4/player/${pid}/overview`, { count: 10 }],
+      [`/v4/player/${pid}/overview`, { take: 10 }],
+    ];
+    const lines = [];
+    for (const [path, params] of tests) {
+      try {
+        const data = await v4(path, params);
+        const n = (data?.results ?? []).length;
+        const keys = Object.keys(data ?? {}).join(", ");
+        lines.push(`✓ ${path} ${JSON.stringify(params)} → ${n} results | keys: ${keys}`);
+      } catch(e) {
+        lines.push(`✗ ${path} ${JSON.stringify(params)} → ${e.message.slice(0,80)}`);
+      }
+    }
     return { content: [{ type: "text", text: lines.join("\n") }] };
   }
 );
