@@ -1,0 +1,19 @@
+{
+  "name": "utr-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP server for UTR Sports - fetch player profiles, match history, and tournament data",
+  "type": "module",
+  "main": "index.js",
+  "bin": {
+    "utr-mcp": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.10.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
