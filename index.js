@@ -12,14 +12,20 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-const JWT = process.env.UTR_JWT;
+const JWT             = process.env.UTR_JWT;
 const DEFAULT_PLAYER_ID = process.env.UTR_PLAYER_ID;
-const API_BASE = "https://api.utrsports.net";
-const APP_BASE = "https://app.universaltennis.com";
+const USTA_BEARER     = process.env.USTA_BEARER;
+const USTA_CHILD_UAID = process.env.USTA_CHILD_UAID ?? "2019010660";
+const API_BASE  = "https://api.utrsports.net";
+const APP_BASE  = "https://app.universaltennis.com";
+const USTA_BASE = "https://services.usta.com";
 
 if (!JWT) {
   process.stderr.write("[utr-mcp] ERROR: UTR_JWT is required.\n");
   process.exit(1);
+}
+if (!USTA_BEARER) {
+  process.stderr.write("[utr-mcp] WARN: USTA_BEARER not set — USTA tools will fail.\n");
 }
 
 async function utrFetch(base, path, params = {}) {
@@ -44,6 +50,27 @@ async function utrFetch(base, path, params = {}) {
 
 const v4 = (path, params) => utrFetch(API_BASE, path, params);
 const v1 = (path, params) => utrFetch(APP_BASE, path, params);
+
+async function ustaFetch(path, params = {}) {
+  if (!USTA_BEARER) throw new Error("USTA_BEARER env var not set.");
+  const url = new URL(`${USTA_BASE}${path}`);
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
+  }
+  const res = await fetch(url.toString(), {
+    headers: {
+      Authorization: `Bearer ${USTA_BEARER}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      "User-Agent": "Mozilla/5.0 (compatible; utr-mcp/2.0)",
+    },
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`USTA ${res.status} ${res.statusText}: ${body.slice(0, 300)}`);
+  }
+  return res.json();
+}
 
 function fmtUtr(p) {
   return p?.singlesUtrDisplay ?? p?.myUtrSinglesDisplay
@@ -72,6 +99,16 @@ function fmtScore(score) {
     const tb = s?.tiebreak != null ? `(${s.tiebreak})` : "";
     return `${s?.winner ?? "?"}–${s?.loser ?? "?"}${tb}`;
   }).join(", ");
+}
+
+function parseUstaLevel(name = "") {
+  const m = name.match(/Level\s*(\d+)/i);
+  return m ? `L${m[1]}` : null;
+}
+
+function fmtUstaDate(d) {
+  if (!d) return "";
+  return new Date(d + "T00:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
 }
 
 function extractSelf(results, pid) {
@@ -306,6 +343,140 @@ server.tool("probe_endpoints",
       }
     }
     return { content: [{ type: "text", text: lines.join("\n") }] };
+  }
+);
+
+server.tool("get_usta_schedule",
+  "Get Cole's upcoming USTA tournament registrations from services.usta.com.",
+  {
+    child_uaid: z.string().optional().describe("USTA child UAID (defaults to USTA_CHILD_UAID env var)."),
+    include_withdrawn: z.boolean().optional().default(false).describe("Include WITHDRAWN registrations."),
+  },
+  async ({ child_uaid, include_withdrawn }) => {
+    const uaid = child_uaid ?? USTA_CHILD_UAID;
+    const data = await ustaFetch(`/v1/dataexchange/schedule/me/child/${uaid}/upcoming`);
+    const registrations = data?.data?.players?.[0]?.registrations ?? [];
+
+    const filtered = registrations.filter(r => {
+      if (r.isCancelled) return false;
+      if (!include_withdrawn && r.status === "WITHDRAWN") return false;
+      return true;
+    });
+
+    if (!filtered.length) {
+      return { content: [{ type: "text", text: "No upcoming USTA registrations found." }] };
+    }
+
+    const lines = filtered.map(r => {
+      const level = parseUstaLevel(r.name);
+      const levelTag = level ? ` **(${level})**` : "";
+      const start = fmtUstaDate(r.period?.startDate);
+      const end   = r.period?.endDate && r.period.endDate !== r.period.startDate
+        ? ` – ${fmtUstaDate(r.period.endDate)}`
+        : "";
+      const loc   = [r.city, r.state].filter(Boolean).join(", ");
+      const status = r.status === "WITHDRAWN" ? " ↩️ WITHDRAWN" : " ✅";
+      return [
+        `### ${r.name}${levelTag}${status}`,
+        `**Dates:** ${start}${end}`,
+        loc ? `**Location:** ${r.location ? `${r.location}, ` : ""}${loc}` : null,
+        r.url ? `**URL:** ${r.url}` : null,
+      ].filter(Boolean).join("\n");
+    });
+
+    return { content: [{ type: "text", text: `## USTA Schedule (${filtered.length})\n\n${lines.join("\n\n")}` }] };
+  }
+);
+
+server.tool("get_usta_rankings",
+  "Get Cole's USTA ranking points and position in the Eastern section.",
+  {
+    child_uaid: z.string().optional().describe("USTA child UAID (defaults to USTA_CHILD_UAID env var)."),
+  },
+  async ({ child_uaid }) => {
+    const uaid = child_uaid ?? USTA_CHILD_UAID;
+    const paths = [
+      `/v1/dataexchange/rankings/me/child/${uaid}`,
+      `/v1/rankings/player/${uaid}`,
+      `/v1/dataexchange/player/me/child/${uaid}`,
+    ];
+    for (const path of paths) {
+      try {
+        const data = await ustaFetch(path);
+        return { content: [{ type: "text", text: `**Endpoint:** \`${path}\`\n\n\`\`\`json\n${JSON.stringify(data, null, 2).slice(0, 3000)}\n\`\`\`` }] };
+      } catch (e) {
+        if (!e.message.includes("404")) throw e;
+      }
+    }
+    return { content: [{ type: "text", text: "No rankings endpoint responded. All three paths returned 404." }] };
+  }
+);
+
+server.tool("search_usta_tournaments",
+  "Find upcoming USTA junior tournaments (L6/L7, 12U Eastern) not yet on Cole's schedule.",
+  {
+    child_uaid: z.string().optional(),
+    section: z.string().optional().default("eastern"),
+    age_group: z.string().optional().default("12U"),
+    gender: z.string().optional().default("boys"),
+    levels: z.array(z.string()).optional().default(["L6", "L7"]),
+    start_date: z.string().optional().describe("ISO date, defaults to today."),
+    end_date: z.string().optional().describe("ISO date, defaults to 90 days out."),
+    show_withdrawn: z.boolean().optional().default(false),
+  },
+  async ({ child_uaid, section, age_group, gender, levels, start_date, end_date, show_withdrawn }) => {
+    const uaid = child_uaid ?? USTA_CHILD_UAID;
+    const today = new Date().toISOString().slice(0, 10);
+    const in90  = new Date(Date.now() + 90 * 86400000).toISOString().slice(0, 10);
+    const from  = start_date ?? today;
+    const to    = end_date   ?? in90;
+
+    // Collect already-registered/withdrawn IDs for deduplication
+    let registeredIds = new Set();
+    try {
+      const sched = await ustaFetch(`/v1/dataexchange/schedule/me/child/${uaid}/upcoming`);
+      const regs  = sched?.data?.players?.[0]?.registrations ?? [];
+      for (const r of regs) {
+        if (r.isCancelled) continue;
+        if (!show_withdrawn && r.status === "WITHDRAWN") {
+          if (r.id) registeredIds.add(r.id);
+          continue;
+        }
+        if (r.status === "REGISTERED" && r.id) registeredIds.add(r.id);
+      }
+    } catch { /* schedule fetch is best-effort */ }
+
+    const probeParams = { section, ageGroup: age_group, gender, startDate: from, endDate: to };
+    const probePaths = [
+      `/v1/dataexchange/schedule/search`,
+      `/v1/dataexchange/tournaments/search`,
+      `/v1/tournaments/search`,
+      `/v1/dataexchange/schedule/upcoming`,
+    ];
+
+    for (const path of probePaths) {
+      try {
+        const data = await ustaFetch(path, probeParams);
+        const raw  = JSON.stringify(data, null, 2).slice(0, 4000);
+        return { content: [{ type: "text", text: `**Endpoint found:** \`${path}\`\n\n\`\`\`json\n${raw}\n\`\`\`` }] };
+      } catch (e) {
+        if (!e.message.match(/404|400/)) {
+          return { content: [{ type: "text", text: `Unexpected error on \`${path}\`: ${e.message}` }] };
+        }
+      }
+    }
+
+    return {
+      content: [{
+        type: "text",
+        text: [
+          "All four probe endpoints returned 404/400. Next step: use Playwright to intercept XHR on playtennis.usta.com/tournaments.",
+          "",
+          "Already-registered/withdrawn IDs collected for deduplication:",
+          ...[...registeredIds].map(id => `  • ${id}`),
+        ].join("\n"),
+      }],
+    };
   }
 );
 
