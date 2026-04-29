@@ -80,3 +80,10 @@ See cole-tennis-mcp-v2-briefing.md for full spec.
 - search_usta_tournaments — upcoming tournaments NOT yet registered (deduped)
 - get_tournament_field — UTR event field analysis
 - add_tournament_to_calendar — Google Calendar + Gmail integration
+
+## Planned: USTA Tournament Search Refactor (v3)
+
+See usta-tournament-search-api.md for full spec.
+
+### Refactor these methods based off new spec
+- search_usta_tournaments — upcoming tournaments NOT yet registered (deduped)
