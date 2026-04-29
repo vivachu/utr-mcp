@@ -63,3 +63,20 @@ Deployed via Claude Desktop's `claude_desktop_config.json`:
 ```
 
 JWT tokens expire after days–weeks; refresh by re-extracting the `jwt` cookie from the UTR Sports site (Application → Cookies in DevTools).
+
+## Planned: USTA Integration (v2)
+
+See cole-tennis-mcp-v2-briefing.md for full spec.
+
+### New env vars
+- USTA_BEARER — JWT Bearer token (expires daily, refresh via /oauth/token)
+- USTA_REFRESH_TOKEN — long-lived refresh token for silent renewal
+- USTA_PARENT_UAID — 2019010659
+- USTA_CHILD_UAID — 2019010660 (Cole)
+
+### New tools
+- get_usta_schedule — Cole's registered tournaments
+- get_usta_rankings — USTA section ranking points  
+- search_usta_tournaments — upcoming tournaments NOT yet registered (deduped)
+- get_tournament_field — UTR event field analysis
+- add_tournament_to_calendar — Google Calendar + Gmail integration
