@@ -75,12 +75,16 @@ async function ustaFetch(path, params = {}) {
 }
 
 async function clubSparkSearch(body) {
+  // ClubSpark's unified-search API is CORS-gated to the playtennis.usta.com origin.
+  // Spoofing Origin + Referer is necessary for server-side requests to get past the 400.
   const res = await fetch(CLUBSPARK_SEARCH_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Accept: "application/json",
-      "User-Agent": "Mozilla/5.0 (compatible; utr-mcp/2.0)",
+      Origin: "https://playtennis.usta.com",
+      Referer: "https://playtennis.usta.com/tournaments",
+      "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     },
     body: JSON.stringify(body),
   });
