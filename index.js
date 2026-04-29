@@ -16,9 +16,11 @@ const JWT             = process.env.UTR_JWT;
 const DEFAULT_PLAYER_ID = process.env.UTR_PLAYER_ID;
 const USTA_BEARER     = process.env.USTA_BEARER;
 const USTA_CHILD_UAID = process.env.USTA_CHILD_UAID ?? "2019010660";
-const API_BASE  = "https://api.utrsports.net";
-const APP_BASE  = "https://app.universaltennis.com";
-const USTA_BASE = "https://services.usta.com";
+const API_BASE        = "https://api.utrsports.net";
+const APP_BASE        = "https://app.universaltennis.com";
+const USTA_BASE       = "https://services.usta.com";
+const CLUBSPARK_SEARCH_URL =
+  "https://prd-usta-kube.clubspark.pro/unified-search-api/api/Search/tournaments/Query?indexSchema=tournament";
 
 if (!JWT) {
   process.stderr.write("[utr-mcp] ERROR: UTR_JWT is required.\n");
@@ -72,6 +74,43 @@ async function ustaFetch(path, params = {}) {
   return res.json();
 }
 
+async function clubSparkSearch(body) {
+  const res = await fetch(CLUBSPARK_SEARCH_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      "User-Agent": "Mozilla/5.0 (compatible; utr-mcp/2.0)",
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`ClubSpark ${res.status} ${res.statusText}: ${text.slice(0, 300)}`);
+  }
+  return res.json();
+}
+
+// Client-side filter used by search_usta_tournaments; also copied into test-usta.js.
+// levels: ["L6","L7"] → checks tournamentLevel field and tournament name.
+// gender/ageGroup: matched against tournament name (case-insensitive substring).
+function filterClubSparkResults(results, { levels = [], gender = "", ageGroup = "" } = {}) {
+  return results.filter(t => {
+    const levelField = String(t.tournamentLevel ?? "");
+    const name       = String(t.name ?? "");
+    const levelOk = levels.length === 0 || levels.some(l => {
+      const n = l.replace(/\D/g, "");
+      return new RegExp(`\\blevel\\s*${n}\\b`, "i").test(levelField) ||
+             new RegExp(`\\bl${n}\\b`, "i").test(levelField) ||
+             new RegExp(`\\blevel\\s*${n}\\b`, "i").test(name) ||
+             new RegExp(`\\bl${n}\\b`, "i").test(name);
+    });
+    const genderOk = !gender || new RegExp(`\\b${gender}\\b`, "i").test(name);
+    const ageOk    = !ageGroup || new RegExp(`\\b${ageGroup}\\b`, "i").test(name);
+    return levelOk && genderOk && ageOk;
+  });
+}
+
 function fmtUtr(p) {
   return p?.singlesUtrDisplay ?? p?.myUtrSinglesDisplay
     ?? (p?.singlesUtr != null ? Number(p.singlesUtr).toFixed(2) : null);
@@ -99,6 +138,16 @@ function fmtScore(score) {
     const tb = s?.tiebreak != null ? `(${s.tiebreak})` : "";
     return `${s?.winner ?? "?"}–${s?.loser ?? "?"}${tb}`;
   }).join(", ");
+}
+
+function fmtRegStatus(status) {
+  if (!status) return null;
+  const s = status.toLowerCase();
+  if (s === "open")         return "Registration: Open";
+  if (s.includes("closed")) return "Registration: Closed";
+  if (s.includes("full"))   return "Registration: Full";
+  if (s.includes("not yet") || s.includes("upcoming")) return "Registration: Not Yet Open";
+  return `Registration: ${status}`;
 }
 
 function parseUstaLevel(name = "") {
@@ -413,26 +462,29 @@ server.tool("get_usta_rankings",
 );
 
 server.tool("search_usta_tournaments",
-  "Find upcoming USTA junior tournaments (L6/L7, 12U Eastern) not yet on Cole's schedule.",
+  "Find upcoming USTA junior tournaments (L6/L7, 12U Boys) near a location, deduped against Cole's schedule.",
   {
-    child_uaid: z.string().optional(),
-    section: z.string().optional().default("eastern"),
-    age_group: z.string().optional().default("12U"),
-    gender: z.string().optional().default("boys"),
-    levels: z.array(z.string()).optional().default(["L6", "L7"]),
-    start_date: z.string().optional().describe("ISO date, defaults to today."),
-    end_date: z.string().optional().describe("ISO date, defaults to 90 days out."),
+    child_uaid:    z.string().optional(),
+    lat:           z.number().optional().default(41.0534).describe("Latitude (default: Greenwich CT)."),
+    lng:           z.number().optional().default(-73.6287).describe("Longitude (default: Greenwich CT)."),
+    radius_miles:  z.number().optional().default(100),
+    age_group:     z.string().optional().default("12U"),
+    gender:        z.string().optional().default("boys"),
+    levels:        z.array(z.string()).optional().default(["L6", "L7"]),
+    start_date:    z.string().optional().describe("ISO date, defaults to today."),
+    end_date:      z.string().optional().describe("ISO date, defaults to 90 days out."),
     show_withdrawn: z.boolean().optional().default(false),
+    take:          z.number().optional().default(50),
   },
-  async ({ child_uaid, section, age_group, gender, levels, start_date, end_date, show_withdrawn }) => {
-    const uaid = child_uaid ?? USTA_CHILD_UAID;
+  async ({ child_uaid, lat, lng, radius_miles, age_group, gender, levels, start_date, end_date, show_withdrawn, take }) => {
+    const uaid  = child_uaid ?? USTA_CHILD_UAID;
     const today = new Date().toISOString().slice(0, 10);
     const in90  = new Date(Date.now() + 90 * 86400000).toISOString().slice(0, 10);
     const from  = start_date ?? today;
     const to    = end_date   ?? in90;
 
-    // Collect already-registered/withdrawn IDs for deduplication
-    let registeredIds = new Set();
+    // Collect already-registered/withdrawn IDs for deduplication (best-effort).
+    const registeredIds = new Set();
     try {
       const sched = await ustaFetch(`/v1/dataexchange/schedule/me/child/${uaid}/upcoming`);
       const regs  = sched?.data?.players?.[0]?.registrations ?? [];
@@ -444,37 +496,58 @@ server.tool("search_usta_tournaments",
         }
         if (r.status === "REGISTERED" && r.id) registeredIds.add(r.id);
       }
-    } catch { /* schedule fetch is best-effort */ }
+    } catch { /* best-effort */ }
 
-    const probeParams = { section, ageGroup: age_group, gender, startDate: from, endDate: to };
-    const probePaths = [
-      `/v1/dataexchange/schedule/search`,
-      `/v1/dataexchange/tournaments/search`,
-      `/v1/tournaments/search`,
-      `/v1/dataexchange/schedule/upcoming`,
-    ];
+    const data = await clubSparkSearch({
+      take,
+      skip: 0,
+      sort: "date",
+      location: { lat, lng, radiusMiles: radius_miles },
+      dateRange: { from: `${from}T00:00:00Z`, to: `${to}T23:59:59Z` },
+    });
 
-    for (const path of probePaths) {
-      try {
-        const data = await ustaFetch(path, probeParams);
-        const raw  = JSON.stringify(data, null, 2).slice(0, 4000);
-        return { content: [{ type: "text", text: `**Endpoint found:** \`${path}\`\n\n\`\`\`json\n${raw}\n\`\`\`` }] };
-      } catch (e) {
-        if (!e.message.match(/404|400/)) {
-          return { content: [{ type: "text", text: `Unexpected error on \`${path}\`: ${e.message}` }] };
-        }
-      }
+    const allResults = data?.results ?? [];
+    const filtered   = filterClubSparkResults(allResults, { levels, gender, ageGroup: age_group });
+    const open       = filtered.filter(t => !registeredIds.has(t.id));
+
+    if (!open.length) {
+      return {
+        content: [{
+          type: "text",
+          text: `No open ${levels.join("/")} ${gender} ${age_group} tournaments found (${filtered.length} matched filters, ${registeredIds.size} already registered).`,
+        }],
+      };
     }
+
+    const lines = open.map(t => {
+      const slug   = t.organizationSlug ?? t.orgSlug ?? "";
+      const detailUrl = slug
+        ? `https://playtennis.usta.com/Competitions/${slug}/Tournaments/Overview/${t.id}`
+        : t.url
+          ? (t.url.startsWith("http") ? t.url : `https://playtennis.usta.com${t.url}`)
+          : null;
+      const start  = fmtUstaDate((t.startDate ?? "").slice(0, 10));
+      const endSlice = (t.endDate ?? "").slice(0, 10);
+      const end    = endSlice && endSlice !== (t.startDate ?? "").slice(0, 10)
+        ? ` – ${fmtUstaDate(endSlice)}`
+        : "";
+      const dist   = t.distance != null ? ` · ${Number(t.distance).toFixed(1)} mi` : "";
+      const level  = parseUstaLevel(t.tournamentLevel ?? "") ?? parseUstaLevel(t.name ?? "");
+      const regStatus = fmtRegStatus(t.registrationStatus ?? t.registrationDeadline);
+      return [
+        `### ${t.name}${level ? ` **(${level})**` : ""}`,
+        `**Dates:** ${start}${end}${dist}`,
+        t.location?.address ? `**Where:** ${t.location.address}` : null,
+        regStatus ? `**${regStatus}**` : null,
+        t.registrationDeadline ? `**Registration Deadline:** ${fmtUstaDate(t.registrationDeadline.slice(0, 10))}` : null,
+        detailUrl ? `**Sign Up / Info:** ${detailUrl}` : null,
+      ].filter(Boolean).join("\n");
+    });
 
     return {
       content: [{
         type: "text",
-        text: [
-          "All four probe endpoints returned 404/400. Next step: use Playwright to intercept XHR on playtennis.usta.com/tournaments.",
-          "",
-          "Already-registered/withdrawn IDs collected for deduplication:",
-          ...[...registeredIds].map(id => `  • ${id}`),
-        ].join("\n"),
+        text: `## Open Tournaments — ${open.length} of ${filtered.length} matching (${registeredIds.size} already registered)\n\n${lines.join("\n\n")}`,
       }],
     };
   }
