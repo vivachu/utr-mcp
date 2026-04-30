@@ -30,7 +30,48 @@ if (!USTA_BEARER) {
   process.stderr.write("[utr-mcp] WARN: USTA_BEARER not set — USTA tools will fail.\n");
 }
 
+// ─── Throttle helpers ─────────────────────────────────────────────────────
+// Keeps one last-call timestamp per domain and enforces a minimum gap plus
+// a random jitter before each outbound request, making traffic look human.
+// No retry logic anywhere — callers receive the error immediately.
+
+const _lastCallMs = new Map();
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Returns a random integer in [0, maxMs).
+function jitter(maxMs) {
+  return Math.floor(Math.random() * maxMs);
+}
+
+// Waits until at least minGapMs has passed since the last call to `domain`,
+// then adds a random extra delay of up to jitterMs before returning.
+async function throttle(domain, minGapMs, jitterMs) {
+  const now     = Date.now();
+  const elapsed = now - (_lastCallMs.get(domain) ?? 0);
+  const gap     = Math.max(0, minGapMs - elapsed);
+  const wait    = gap + jitter(jitterMs);
+  if (wait > 0) {
+    process.stderr.write(`[utr-mcp] throttle ${domain}: waiting ${wait}ms\n`);
+    await sleep(wait);
+  }
+  _lastCallMs.set(domain, Date.now());
+}
+
+// Domain keys and their [minGapMs, jitterMs] budgets.
+// ClubSpark is the most bot-sensitive so gets the longest gaps.
+const THROTTLE = {
+  utr:        [500,  1500],   // avg ~1.25 s between UTR API calls
+  usta:       [1000, 2000],   // avg ~2 s between services.usta.com calls
+  clubspark:  [3000, 4000],   // avg ~5 s between ClubSpark search calls
+};
+
+// ─── Fetch wrappers ───────────────────────────────────────────────────────
+
 async function utrFetch(base, path, params = {}) {
+  await throttle("utr", ...THROTTLE.utr);
   const url = new URL(`${base}${path}`);
   for (const [k, v] of Object.entries(params)) {
     if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
@@ -45,6 +86,9 @@ async function utrFetch(base, path, params = {}) {
   });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
+    if (res.status === 429) {
+      process.stderr.write(`[utr-mcp] UTR rate-limited (429) — back off before retrying.\n`);
+    }
     throw new Error(`UTR ${res.status} ${res.statusText}: ${body.slice(0, 300)}`);
   }
   return res.json();
@@ -55,6 +99,7 @@ const v1 = (path, params) => utrFetch(APP_BASE, path, params);
 
 async function ustaFetch(path, params = {}) {
   if (!USTA_BEARER) throw new Error("USTA_BEARER env var not set.");
+  await throttle("usta", ...THROTTLE.usta);
   const url = new URL(`${USTA_BASE}${path}`);
   for (const [k, v] of Object.entries(params)) {
     if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
@@ -69,6 +114,9 @@ async function ustaFetch(path, params = {}) {
   });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
+    if (res.status === 429) {
+      process.stderr.write(`[utr-mcp] USTA rate-limited (429) — back off before retrying.\n`);
+    }
     throw new Error(`USTA ${res.status} ${res.statusText}: ${body.slice(0, 300)}`);
   }
   return res.json();
@@ -77,6 +125,7 @@ async function ustaFetch(path, params = {}) {
 async function clubSparkSearch(body) {
   // ClubSpark's unified-search API is CORS-gated to the playtennis.usta.com origin.
   // Spoofing Origin + Referer is necessary for server-side requests to get past the 400.
+  await throttle("clubspark", ...THROTTLE.clubspark);
   const res = await fetch(CLUBSPARK_SEARCH_URL, {
     method: "POST",
     headers: {
@@ -90,6 +139,9 @@ async function clubSparkSearch(body) {
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
+    if (res.status === 429) {
+      process.stderr.write(`[utr-mcp] ClubSpark rate-limited (429) — back off before retrying.\n`);
+    }
     throw new Error(`ClubSpark ${res.status} ${res.statusText}: ${text.slice(0, 300)}`);
   }
   return res.json();

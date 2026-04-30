@@ -36,6 +36,25 @@ function assertContains(label, actual, substring) {
 
 // ─── Helper functions (copied from index.js) ──────────────────────────────
 
+// Throttle helpers — copied from index.js, must stay in sync.
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+function jitter(maxMs) {
+  return Math.floor(Math.random() * maxMs);
+}
+{
+  const _lastCallMs = new Map();
+  globalThis._testThrottle = async function throttle(domain, minGapMs, jitterMs) {
+    const now     = Date.now();
+    const elapsed = now - (_lastCallMs.get(domain) ?? 0);
+    const gap     = Math.max(0, minGapMs - elapsed);
+    const wait    = gap + jitter(jitterMs);
+    if (wait > 0) await sleep(wait);
+    _lastCallMs.set(domain, Date.now());
+  };
+}
+
 function parseUstaLevel(name = "") {
   const m = name.match(/Level\s*(\d+)/i);
   return m ? `L${m[1]}` : null;
@@ -208,6 +227,47 @@ assert("standard date",    fmtUstaDate("2026-05-03"), "May 3, 2026");
 assert("multi-digit day",  fmtUstaDate("2026-05-17"), "May 17, 2026");
 assert("empty string",     fmtUstaDate(""),           "");
 assert("null",             fmtUstaDate(null),          "");
+
+console.log("\n── sleep / jitter ───────────────────────────────────────────");
+{
+  const t0 = Date.now();
+  await sleep(50);
+  const elapsed = Date.now() - t0;
+  assert("sleep(50) waits at least 50ms", elapsed >= 50, true);
+  assert("sleep(50) doesn't overshoot by >200ms", elapsed < 250, true);
+
+  const samples = Array.from({ length: 200 }, () => jitter(100));
+  assert("jitter always in [0, 100)",  samples.every(v => v >= 0 && v < 100), true);
+  assert("jitter produces varied values", new Set(samples).size > 10, true);
+}
+
+console.log("\n── throttle: min-gap enforcement ───────────────────────────");
+{
+  const throttle = globalThis._testThrottle;
+
+  // First call to a fresh domain should be near-instant (only jitter, no gap).
+  const d1 = `test-domain-${Date.now()}`;
+  const t1 = Date.now();
+  await throttle(d1, 0, 10);       // minGap=0, jitter up to 10ms
+  assert("first call completes quickly", Date.now() - t1 < 100, true);
+
+  // Second call immediately after must wait at least minGapMs.
+  const d2 = `test-domain-${Date.now()}-b`;
+  await throttle(d2, 0, 0);        // prime the domain
+  const t2 = Date.now();
+  await throttle(d2, 80, 0);       // minGap=80ms, jitter=0 — deterministic wait
+  const waited = Date.now() - t2;
+  assert("second call waits minGapMs", waited >= 75, true);   // 5ms tolerance
+  assert("second call doesn't wildly overshoot", waited < 300, true);
+
+  // Third call after minGap has already elapsed should be near-instant.
+  const d3 = `test-domain-${Date.now()}-c`;
+  await throttle(d3, 0, 0);
+  await sleep(100);                 // let more than minGap pass
+  const t3 = Date.now();
+  await throttle(d3, 50, 0);       // minGap=50 but 100ms already elapsed → no wait
+  assert("call after gap elapsed is immediate", Date.now() - t3 < 50, true);
+}
 
 console.log("\n── get_usta_schedule: default (REGISTERED only) ─────────────");
 {
